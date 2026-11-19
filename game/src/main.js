@@ -8,6 +8,10 @@ import { createRng } from './rng.js';
 import { createCamera, updateCamera, renderWorld } from './render.js';
 import { drawHUD, drawMinimap } from './hud.js';
 import { saveGame, loadGame } from './save.js';
+import { createWanted, addCrime, updateWanted, stopCop, resetWanted } from './wanted.js';
+import { spawnPedestrians, updatePedestrians, knockDown } from './pedestrians.js';
+import { createMissions, startMission, updateMissions, activeMarker, missionInfo } from './missions.js';
+import { initAudio, playPickup, playDeliver, playBusted, playButton, playWantedUp } from './audio.js';
 
 const params = new URLSearchParams(window.location.search);
 const shotParam = params.get('shot');
@@ -29,6 +33,7 @@ const input = {
 };
 
 window.addEventListener('keydown', (e) => {
+  initAudio();
   const key = e.key.toLowerCase();
   input.keys[key] = true;
   if (key === 'shift') input.shift = true;
@@ -44,12 +49,19 @@ window.addEventListener('keyup', (e) => {
 });
 
 // Game state
-let screen = 'title'; // title, playing, paused, end
+let screen = 'title';
 let city, player, traffic, camera, state;
 let money = 0;
-let clock = 8 * 3600; // Start at 8:00 AM
+let clock = 8 * 3600;
 let showControlsHint = true;
 let hintTimer = 5;
+let endStats = null;
+
+function makeState() {
+  return { city, player, traffic, camera, clock, money, nearCar: null, showControlsHint,
+    rng: null, wanted: null, missions: null, peds: null,
+    banner: null, marker: null, mission: null };
+}
 
 function initGame() {
   city = generateCity(seed);
@@ -57,7 +69,6 @@ function initGame() {
   traffic = spawnTraffic(city, rng, 15);
   camera = createCamera();
 
-  // Try loading saved position
   const saved = loadGame();
   let startX = 500, startY = 500;
   if (saved && saved.seed === seed) {
@@ -67,13 +78,16 @@ function initGame() {
   }
 
   player = createPlayer(startX, startY);
-  state = { city, player, traffic, camera, clock, money, nearCar: null, showControlsHint };
+  state = makeState();
+  state.rng = rng;
+  state.wanted = createWanted();
+  state.missions = createMissions();
+  state.peds = spawnPedestrians(city, rng, 12);
 }
 
 function findNearCar() {
   if (player.inVehicle) return null;
   let nearest = null, minDist = 60;
-  // Check parked cars
   for (const car of city.parkedCars) {
     const dx = car.x - player.x;
     const dy = car.y - player.y;
@@ -85,20 +99,20 @@ function findNearCar() {
 
 function enterExitCar() {
   if (player.inVehicle) {
-    // Exit
     const v = player.inVehicle;
     player.x = v.x + Math.cos(v.angle + Math.PI / 2) * 30;
     player.y = v.y + Math.sin(v.angle + Math.PI / 2) * 30;
     player.inVehicle = null;
+    playButton();
   } else {
     const car = findNearCar();
     if (car) {
-      // Remove from parked list if it's there
       const idx = city.parkedCars.indexOf(car);
       if (idx >= 0) city.parkedCars.splice(idx, 1);
-      // Create a drivable vehicle
       const v = createVehicle(car.x, car.y, car.color, car.angle);
       player.inVehicle = v;
+      addCrime(state.wanted);
+      playButton();
     }
   }
 }
@@ -106,10 +120,9 @@ function enterExitCar() {
 function update(dt) {
   if (screen !== 'playing') return;
 
-  clock += dt * 60; // 1 real second = 1 game minute
+  clock += dt * 60;
   if (clock >= 24 * 3600) clock -= 24 * 3600;
 
-  // Controls hint fade
   if (showControlsHint) {
     hintTimer -= dt;
     if (hintTimer <= 0) showControlsHint = false;
@@ -130,24 +143,106 @@ function update(dt) {
     updatePlayer(player, input, dt, city.colliders);
   }
 
-  // Traffic
-  updateTraffic(traffic, city, dt);
+  // Traffic (with seeded RNG)
+  updateTraffic(traffic, city, dt, state.rng);
+
+  // Pedestrians
+  updatePedestrians(state.peds, player, dt);
+
+  // Pedestrian hits by car
+  if (player.inVehicle) {
+    for (const p of state.peds) {
+      const dx = p.x - player.x;
+      const dy = p.y - player.y;
+      if (dx * dx + dy * dy < 1600) {
+        if (knockDown(p)) addCrime(state.wanted);
+      }
+    }
+  }
+
+  // Traffic car collisions
+  if (player.inVehicle) {
+    for (const v of traffic) {
+      const dx = v.x - player.x;
+      const dy = v.y - player.y;
+      if (dx * dx + dy * dy < 900) addCrime(state.wanted);
+    }
+  }
+
+  // Ramming police cars
+  if (player.inVehicle && state.wanted) {
+    for (const cop of state.wanted.police) {
+      if (cop.stopped || cop.gaveUp) continue;
+      const dx = cop.x - player.x;
+      const dy = cop.y - player.y;
+      if (dx * dx + dy * dy < 900 && Math.abs(player.inVehicle.speed) > 60) {
+        stopCop(cop);
+        addCrime(state.wanted);
+      }
+    }
+  }
+
+  // Wanted system
+  const wev = updateWanted(state.wanted, player, city, camera, dt, state.rng);
+  if (wev.busted) {
+    playBusted();
+    state.wanted.busted = false;
+    resetWanted(state.wanted);
+    money = Math.max(0, money - 200);
+  }
+
+  // Missions — auto-start when near the marker
+  const ms = state.missions;
+  if (ms.status === 'ready' && ms.index < 3) {
+    const marker = activeMarker(ms);
+    if (marker) {
+      const dx = player.x - marker.x;
+      const dy = player.y - marker.y;
+      const needCar = ms.index > 0;
+      if (dx * dx + dy * dy < 2500) {
+        if (!needCar || player.inVehicle) {
+          startMission(ms, city, state.rng, player);
+        }
+      }
+    }
+  }
+
+  const mev = updateMissions(ms, player, city, state.rng, dt);
+  if (mev.arrived) {
+    money += mev.reward;
+    if (ms.index === 1) playPickup();
+    else playDeliver();
+  }
+  if (mev.expired) {
+    playBusted();
+  }
+  if (mev.allDone) {
+    endStats = {
+      earned: ms.totalEarned,
+      elapsed: ms.stats.elapsed,
+      completed: ms.index,
+    };
+    screen = 'end';
+    return;
+  }
 
   // Camera
   updateCamera(camera, player.x, player.y, canvas.width, canvas.height);
 
-  // Near car detection
+  // Reflect into state for HUD/render
   state.nearCar = findNearCar();
   state.clock = clock;
   state.money = money;
   state.showControlsHint = showControlsHint;
+  state.banner = ms.banner;
+  state.marker = activeMarker(ms);
+  state.mission = missionInfo(ms);
 }
 
 function drawTitleScreen() {
   ctx.fillStyle = '#1a2332';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Background city silhouette
   ctx.fillStyle = '#2a3a52';
   for (let i = 0; i < 20; i++) {
     const bx = i * 80 - 20;
@@ -155,13 +250,11 @@ function drawTitleScreen() {
     ctx.fillRect(bx, canvas.height - 200 - bh, 60, bh + 200);
   }
 
-  // Beach and ocean
   ctx.fillStyle = '#f0d8a0';
   ctx.fillRect(0, canvas.height - 200, canvas.width, 100);
   ctx.fillStyle = '#3b9bd4';
   ctx.fillRect(0, canvas.height - 100, canvas.width, 100);
 
-  // Title
   ctx.fillStyle = '#fbbf24';
   ctx.font = 'bold 64px system-ui, sans-serif';
   ctx.textAlign = 'center';
@@ -171,7 +264,6 @@ function drawTitleScreen() {
   ctx.font = '24px system-ui, sans-serif';
   ctx.fillText('An open-world coastal city', canvas.width / 2, 230);
 
-  // Controls
   ctx.fillStyle = '#e2e8f0';
   ctx.font = '18px system-ui, sans-serif';
   const controls = [
@@ -184,7 +276,6 @@ function drawTitleScreen() {
     ctx.fillText(line, canvas.width / 2, 320 + i * 32);
   });
 
-  // Prompt
   ctx.fillStyle = '#4ade80';
   ctx.font = 'bold 28px system-ui, sans-serif';
   ctx.fillText('Click or Press Enter to Play', canvas.width / 2, canvas.height - 280);
@@ -214,11 +305,22 @@ function drawEndScreen() {
   ctx.fillStyle = '#4ade80';
   ctx.font = 'bold 56px system-ui, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('MISSION COMPLETE', canvas.width / 2, 200);
+  ctx.fillText('MISSION COMPLETE', canvas.width / 2, 140);
+
+  if (endStats) {
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '24px system-ui, sans-serif';
+    ctx.fillText(`Jobs Completed: ${endStats.completed}/${endStats.completed}`, canvas.width / 2, 200);
+
+    const mins = Math.floor(endStats.elapsed / 60);
+    const secs = Math.floor(endStats.elapsed % 60);
+    ctx.fillText(`Time: ${mins}:${secs.toString().padStart(2, '0')}`, canvas.width / 2, 235);
+  }
 
   ctx.fillStyle = '#fbbf24';
-  ctx.font = 'bold 36px system-ui, sans-serif';
-  ctx.fillText(`$ ${money.toLocaleString()}`, canvas.width / 2, 300);
+  ctx.font = 'bold 40px system-ui, sans-serif';
+  const displayMoney = endStats ? endStats.earned : money;
+  ctx.fillText(`$ ${displayMoney.toLocaleString()}`, canvas.width / 2, 310);
 
   ctx.fillStyle = '#94a3b8';
   ctx.font = '22px system-ui, sans-serif';
@@ -231,7 +333,6 @@ function drawEndScreen() {
 }
 
 function render() {
-  // Resize canvases
   if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
@@ -251,10 +352,8 @@ function render() {
     return;
   }
 
-  // Playing or paused — draw world
   renderWorld(ctx, state, canvas.width, canvas.height);
 
-  // HUD on separate canvas
   hudCtx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
   drawHUD(hudCtx, state, hudCanvas.width, hudCanvas.height);
   drawMinimap(hudCtx, state, hudCanvas.width, hudCanvas.height);
@@ -271,22 +370,82 @@ function stageShot(name) {
     screen = 'title';
   } else if (name === 'play') {
     screen = 'playing';
-    // Position player on a road with traffic visible
-    player.x = 500;
-    player.y = 100;
+    // Player driving a car, pedestrians visible, mission pillar, 2-star wanted
+    player.x = 800;
+    player.y = 400;
+    // Put player in a car
+    const car = city.parkedCars.find(c => c.x > 700 && c.x < 900);
+    if (car) {
+      const v = createVehicle(car.x, car.y, car.color, car.angle);
+      player.inVehicle = v;
+      const idx = city.parkedCars.indexOf(car);
+      if (idx >= 0) city.parkedCars.splice(idx, 1);
+    }
+    // 2-star wanted with police
+    state.wanted.level = 2;
+    state.wanted.maxLevelReached = 2;
+    // Start a mission for the marker pillar
+    state.missions.status = 'active';
+    state.missions.index = 0;
+    state.missions.marker = { x: 1600, y: 600 };
+    state.missions.timeLeft = 0;
+    // Move camera
+    camera.x = player.x - canvas.width / 2;
+    camera.y = player.y - canvas.height / 2;
+    showControlsHint = false;
+    // Tick wanted to spawn police
+    updateWanted(state.wanted, player, city, camera, 0.5, state.rng);
+  } else if (name === 'chase') {
+    screen = 'playing';
+    // Player in car being chased by police
+    player.x = 1200;
+    player.y = 600;
+    const car = city.parkedCars.find(c => c.x > 1100 && c.x < 1300);
+    if (car) {
+      const v = createVehicle(car.x, car.y, car.color, car.angle);
+      player.inVehicle = v;
+      const idx = city.parkedCars.indexOf(car);
+      if (idx >= 0) city.parkedCars.splice(idx, 1);
+    }
+    if (player.inVehicle) {
+      player.inVehicle.speed = 200;
+      player.inVehicle.angle = 0.3;
+    }
+    // 3-star wanted
+    state.wanted.level = 3;
+    state.wanted.maxLevelReached = 3;
+    // Spawn police behind the player
+    updateWanted(state.wanted, player, city, camera, 0.5, state.rng);
+    // Position police behind
+    for (const cop of state.wanted.police) {
+      cop.x = player.x - 120 + Math.random() * 200;
+      cop.y = player.y - 80;
+      cop.angle = 0.3;
+      cop.speed = 220;
+    }
     camera.x = player.x - canvas.width / 2;
     camera.y = player.y - canvas.height / 2;
     showControlsHint = false;
   } else if (name === 'end') {
     screen = 'end';
-    money = 12500;
+    endStats = { earned: 2500, elapsed: 185, completed: 3 };
+    money = 2500;
   }
   // Render a few frames to settle
   let frames = 0;
   function paintShot() {
+    // Update pedestrians for the shot
+    if (screen === 'playing') {
+      state.banner = state.missions.banner;
+      state.marker = activeMarker(state.missions);
+      state.mission = missionInfo(state.missions);
+      state.clock = clock;
+      state.money = money;
+      state.showControlsHint = false;
+    }
     render();
     frames++;
-    if (frames < 3) requestAnimationFrame(paintShot);
+    if (frames < 4) requestAnimationFrame(paintShot);
     else window.__shotReady = true;
   }
   requestAnimationFrame(paintShot);
@@ -298,9 +457,14 @@ function gameLoop(timestamp) {
   const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
   lastTime = timestamp;
 
-  // Handle screen transitions
   if (screen === 'title' && (input.enterPressed || input.ePressed)) {
+    initGame();
     screen = 'playing';
+    endStats = null;
+    money = 0;
+    clock = 8 * 3600;
+    showControlsHint = true;
+    hintTimer = 5;
     input.enterPressed = false;
     input.ePressed = false;
   }
@@ -314,7 +478,13 @@ function gameLoop(timestamp) {
     saveGame({ money, player, seed });
   }
   if (screen === 'end' && (input.enterPressed || input.ePressed)) {
-    screen = 'title';
+    initGame();
+    screen = 'playing';
+    endStats = null;
+    money = 0;
+    clock = 8 * 3600;
+    showControlsHint = true;
+    hintTimer = 5;
     input.enterPressed = false;
     input.ePressed = false;
   }
@@ -330,8 +500,18 @@ function gameLoop(timestamp) {
 
 // Click to start
 canvas.addEventListener('click', () => {
-  if (screen === 'title') screen = 'playing';
-  else if (screen === 'end') screen = 'title';
+  initAudio();
+  if (screen === 'title') {
+    initGame();
+    screen = 'playing';
+    endStats = null;
+    money = 0;
+  } else if (screen === 'end') {
+    initGame();
+    screen = 'playing';
+    endStats = null;
+    money = 0;
+  }
 });
 
 // Start

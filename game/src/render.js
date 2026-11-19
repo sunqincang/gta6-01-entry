@@ -3,12 +3,16 @@
 import { WORLD } from './city.js';
 import { drawPlayer } from './player.js';
 import { drawVehicle } from './vehicles.js';
+import { drawPedestrians } from './pedestrians.js';
+import { drawMarker } from './missions.js';
 
 export function createCamera() {
   return { x: 0, y: 0, targetX: 0, targetY: 0 };
 }
 
 export function updateCamera(cam, targetX, targetY, viewW, viewH) {
+  cam.viewW = viewW;
+  cam.viewH = viewH;
   cam.targetX = targetX - viewW / 2;
   cam.targetY = targetY - viewH / 2;
   cam.x += (cam.targetX - cam.x) * 0.12;
@@ -147,11 +151,39 @@ export function renderWorld(ctx, state, viewW, viewH) {
     drawVehicle(ctx, v, camX, camY);
   }
 
+  // Police cars
+  if (state.wanted) {
+    for (const cop of state.wanted.police) {
+      if (cop.stopped || cop.gaveUp) continue;
+      if (cop.x < camX - 60 || cop.x > camX + viewW + 60) continue;
+      if (cop.y < camY - 60 || cop.y > camY + viewH + 60) continue;
+      drawVehicle(ctx, cop, camX, camY);
+      // Siren lights
+      const sx = cop.x - camX;
+      const sy = cop.y - camY;
+      const flash = Math.sin(state.clock * 20 + cop.x) > 0;
+      ctx.fillStyle = flash ? '#ff3333' : '#3366ff';
+      ctx.beginPath();
+      ctx.arc(sx, sy - cop.h / 2 - 6, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
   // Buildings
   for (const b of city.buildings) {
     if (b.x + b.w < camX - 10 || b.x > camX + viewW + 10) continue;
     if (b.y + b.h < camY - 10 || b.y > camY + viewH + 10) continue;
     drawBuilding(ctx, b, camX, camY);
+  }
+
+  // Pedestrians
+  if (state.peds) {
+    drawPedestrians(ctx, state.peds, camX, camY);
+  }
+
+  // Mission marker (light pillar)
+  if (state.marker) {
+    drawMarker(ctx, state.marker, camX, camY, state.clock);
   }
 
   // Palm trees

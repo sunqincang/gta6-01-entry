@@ -27,7 +27,7 @@ export function spawnTraffic(city, rng, count = 12) {
   return traffic;
 }
 
-export function updateTraffic(traffic, city, dt) {
+export function updateTraffic(traffic, city, dt, rng) {
   for (const v of traffic) {
     // Simple AI: follow road, turn at intersections
     v.aiTimer -= dt;
@@ -53,18 +53,18 @@ export function updateTraffic(traffic, city, dt) {
 
     // Occasionally turn at intersections
     if (v.aiTimer <= 0) {
-      v.aiTimer = 2 + Math.random() * 3;
+      v.aiTimer = 2 + rng.range(0, 3);
       // Check if near an intersection
       for (const r of city.roads) {
         if (r === road) continue;
         const dist = r.dir === 'h' ? Math.abs(r.y1 - v.y) : Math.abs(r.x1 - v.x);
-        if (dist < 30 && Math.random() < 0.3) {
+        if (dist < 30 && rng.chance(0.3)) {
           // Turn onto this road
           v.road = r;
           if (r.dir === 'h') {
-            v.angle = Math.random() < 0.5 ? 0 : Math.PI;
+            v.angle = rng.chance(0.5) ? 0 : Math.PI;
           } else {
-            v.angle = Math.random() < 0.5 ? Math.PI / 2 : -Math.PI / 2;
+            v.angle = rng.chance(0.5) ? Math.PI / 2 : -Math.PI / 2;
           }
           break;
         }
